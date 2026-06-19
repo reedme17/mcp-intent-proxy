@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# Node
+node_modules/
+dist/
+build/
+*.log
+
+# Env / secrets — NEVER commit API keys
+.env
+.env.*
+*.key
+secrets.*
+config.local.*
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local data / scratch
+tmp/
+scratch/
+*.local
