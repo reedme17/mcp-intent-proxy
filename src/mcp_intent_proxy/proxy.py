@@ -113,23 +113,37 @@ def build_server(
         intent: IntentResult | None = None
         decision = Decision.ALLOW
         trigger_labels: list[str] = []
+        late_registered = False
 
         if classifier is not None:
             tool_meta = _find_tool_meta(name)
             if tool_meta is None:
-                # Unknown tool not seen via tools/list — fail-closed.
-                log.record(tool=name, arguments=arguments, decision="deny", intent=None, rule="fail-closed")
+                # Tool not seen via tools/list. Re-sync from upstream in case
+                # the server legitimately added it after initialization.
+                refreshed = await upstream.list_tools()
+                _preclassify(classifier, refreshed.tools, server_name, server_description)
+                tool_meta = _find_tool_meta(name)
+
+            if tool_meta is None:
+                # Still unknown after re-sync — upstream doesn't have it.
+                log.record(
+                    tool=name, arguments=arguments, decision="deny",
+                    intent=None, rule="fail-closed",
+                    flags=["unknown-tool"],
+                )
                 return types.ServerResult(
                     types.CallToolResult(
                         content=[types.TextContent(
                             type="text",
-                            text="Blocked by policy: unknown tool not in registry. "
-                                 "Do not retry. Inform the user this tool was not "
-                                 "recognized by the authorization proxy.",
+                            text="Blocked: this tool does not exist on the upstream "
+                                 "server. Do not retry. Inform the user.",
                         )],
                         isError=True,
                     )
                 )
+            else:
+                late_registered = name not in _ask_allowed and not _was_in_initial_list(name)
+
             intent = classifier.classify(
                 tool_name=name,
                 tool_description=tool_meta.get("description", ""),
@@ -142,14 +156,39 @@ def build_server(
                 decision, trigger_labels = rule_table.evaluate_detailed(
                     intent.action, intent.sensitivity, intent.externality
                 )
+            # Late-registered tool: escalate to ASK unless already DENY.
+            if late_registered and decision == Decision.ALLOW:
+                decision = Decision.ASK
+                trigger_labels = intent.action
+                intent = IntentResult(
+                    action=intent.action,
+                    sensitivity=intent.sensitivity,
+                    externality=intent.externality,
+                    confidence=intent.confidence,
+                    rationale=(
+                        "[WARNING: this tool was not present when the server "
+                        "started — it appeared after initialization.] "
+                        + intent.rationale
+                    ),
+                )
+                intent_dict = intent.to_dict()
+                logger.warning(
+                    "Late-registered tool '%s' not in initial tools/list; "
+                    "escalating to ASK for user confirmation",
+                    name,
+                )
 
         decision_label = "forward" if classifier is None else decision.value
+        flags = []
+        if late_registered:
+            flags.append("late-registered")
         log.record(
             tool=name,
             arguments=arguments,
             decision=decision_label,
             intent=intent_dict,
             rule=decision.value if classifier is not None and decision != Decision.ALLOW else None,
+            flags=flags or None,
         )
 
         if decision == Decision.DENY:
@@ -223,6 +262,12 @@ def build_server(
     # Tools the user has already said "yes" to during this session.
     _ask_allowed: set[str] = set()
     _elicit = elicit_fn or _default_elicit
+    # Tools that were present in the first tools/list response.
+    _initial_tools: set[str] = set()
+    _initial_list_done = False
+
+    def _was_in_initial_list(tool_name: str) -> bool:
+        return tool_name in _initial_tools
 
     # Registry of known tools populated by _preclassify for lookup at call time.
     _tool_registry: dict[str, dict[str, Any]] = {}
@@ -233,6 +278,7 @@ def build_server(
         srv_name: str,
         srv_desc: str,
     ) -> None:
+        nonlocal _initial_list_done
         batch = []
         for t in tools:
             meta = {
@@ -242,6 +288,9 @@ def build_server(
             }
             _tool_registry[t.name] = meta
             batch.append(meta)
+            if not _initial_list_done:
+                _initial_tools.add(t.name)
+        _initial_list_done = True
         clf.classify_batch(batch, server_name=srv_name, server_description=srv_desc)
         logger.info("Pre-classified %d tools from %s", len(batch), srv_name or "(unknown)")
 

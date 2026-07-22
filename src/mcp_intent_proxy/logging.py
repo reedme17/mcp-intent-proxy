@@ -56,6 +56,7 @@ class DecisionLog:
         decision: str = "forward",
         intent: dict[str, Any] | None = None,
         rule: str | None = None,
+        flags: list[str] | None = None,
     ) -> None:
         entry = {
             "ts": time.time(),
@@ -67,6 +68,8 @@ class DecisionLog:
             entry["intent"] = intent
         if rule is not None:
             entry["rule"] = rule
+        if flags:
+            entry["flags"] = flags
         line = json.dumps(entry, ensure_ascii=False, separators=(",", ":"))
         self._file.write(line + "\n")
         self._file.flush()
