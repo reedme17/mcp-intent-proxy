@@ -1,4 +1,4 @@
-"""CLI entry point: mcp-intent-proxy [--] <upstream command> [args...]"""
+"""CLI entry point: mcp-intent-proxy [options] [--] <upstream command> [args...]"""
 
 from __future__ import annotations
 
@@ -18,6 +18,26 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--no-classify",
+        action="store_true",
+        help="disable the LLM classifier (passthrough-only mode)",
+    )
+    parser.add_argument(
+        "--no-server-context",
+        action="store_true",
+        help="exclude server name/description from classifier input (ablation)",
+    )
+    parser.add_argument(
+        "--server-name",
+        default="",
+        help="upstream server name fed to the classifier",
+    )
+    parser.add_argument(
+        "--server-description",
+        default="",
+        help="upstream server description fed to the classifier",
+    )
+    parser.add_argument(
         "upstream",
         nargs=argparse.REMAINDER,
         help="upstream MCP server command and its arguments",
@@ -30,7 +50,17 @@ def main() -> None:
     if not upstream:
         parser.error("missing upstream server command")
 
-    anyio.run(run_proxy, upstream[0], upstream[1:])
+    async def _run() -> None:
+        await run_proxy(
+            upstream[0],
+            upstream[1:],
+            enable_classifier=not ns.no_classify,
+            include_server_context=not ns.no_server_context,
+            server_name=ns.server_name,
+            server_description=ns.server_description,
+        )
+
+    anyio.run(_run)
 
 
 if __name__ == "__main__":

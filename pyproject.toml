@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "mcp>=1.9",
+    "anthropic>=0.40",
 ]
 
 [project.scripts]

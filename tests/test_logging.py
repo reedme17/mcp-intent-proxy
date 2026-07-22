@@ -12,7 +12,7 @@ UPSTREAM = str(Path(__file__).parent / "upstream_stub.py")
 
 PROXY_PARAMS = StdioServerParameters(
     command=sys.executable,
-    args=["-m", "mcp_intent_proxy", "--", sys.executable, UPSTREAM],
+    args=["-m", "mcp_intent_proxy", "--no-classify", "--", sys.executable, UPSTREAM],
 )
 
 
