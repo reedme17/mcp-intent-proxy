@@ -175,14 +175,9 @@ async def run_proxy(
     *,
     enable_classifier: bool = True,
     include_server_context: bool = True,
-    server_name: str = "",
-    server_description: str = "",
     rules_path: str | None = None,
 ) -> None:
     """Spawn the upstream server and serve the proxy over stdio until EOF."""
-    # Inherit the proxy's full environment: the SDK default is a minimal env,
-    # which would strip variables the upstream server needs (PATH tweaks,
-    # registry overrides, API keys).
     from pathlib import Path
 
     params = StdioServerParameters(command=command, args=args, env=dict(os.environ))
@@ -198,7 +193,20 @@ async def run_proxy(
     try:
         async with stdio_client(params) as (upstream_read, upstream_write):
             async with ClientSession(upstream_read, upstream_write) as upstream:
-                await upstream.initialize()
+                init_result = await upstream.initialize()
+
+                # Auto-detect server identity from the MCP handshake.
+                server_name = ""
+                server_description = ""
+                if init_result.serverInfo:
+                    server_name = init_result.serverInfo.name or ""
+                server_description = init_result.instructions or ""
+                logger.info(
+                    "Connected to upstream: name=%r description=%r",
+                    server_name,
+                    server_description[:80],
+                )
+
                 server = build_server(
                     upstream,
                     log,

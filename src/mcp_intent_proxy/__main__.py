@@ -28,16 +28,6 @@ def main() -> None:
         help="exclude server name/description from classifier input (ablation)",
     )
     parser.add_argument(
-        "--server-name",
-        default="",
-        help="upstream server name fed to the classifier",
-    )
-    parser.add_argument(
-        "--server-description",
-        default="",
-        help="upstream server description fed to the classifier",
-    )
-    parser.add_argument(
         "--rules",
         default=None,
         help="path to rules.yaml policy file (default: ~/.mcp-intent-proxy/rules.yaml)",
@@ -61,8 +51,6 @@ def main() -> None:
             upstream[1:],
             enable_classifier=not ns.no_classify,
             include_server_context=not ns.no_server_context,
-            server_name=ns.server_name,
-            server_description=ns.server_description,
             rules_path=ns.rules,
         )
 
