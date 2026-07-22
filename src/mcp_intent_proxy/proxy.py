@@ -25,16 +25,28 @@ from mcp.server.stdio import stdio_server
 
 from .classifier import Classifier
 from .logging import DecisionLog
+from .rules import Decision, RuleTable
 
 logger = logging.getLogger("mcp_intent_proxy")
 
 SERVER_NAME = "mcp-intent-proxy"
 
 
+DENY_MESSAGE_TEMPLATE = (
+    "Blocked by user policy. This tool was classified as intent={actions} "
+    "(sensitivity={sensitivity}, externality={externality}). "
+    "The user's rules deny this category of operations. "
+    "Do not retry this call and do not attempt to accomplish the same goal "
+    "through other tools. Inform the user that the action was blocked by "
+    "their policy, and that they can change this by editing rules.yaml."
+)
+
+
 def build_server(
     upstream: ClientSession,
     log: DecisionLog,
     classifier: Classifier | None = None,
+    rule_table: RuleTable | None = None,
     server_name: str = "",
     server_description: str = "",
 ) -> Server:
@@ -49,12 +61,14 @@ def build_server(
             _preclassify(classifier, result.tools, server_name, server_description)
         return types.ServerResult(result)
 
-    # tools/call: classify (cache hit after pre-classify), log, and forward.
+    # tools/call: classify (cache hit after pre-classify), check policy, enforce.
     async def _call_tool(request: types.CallToolRequest) -> types.ServerResult:
         name = request.params.name
         arguments = request.params.arguments or {}
 
         intent_dict: dict[str, Any] | None = None
+        decision = Decision.ALLOW
+
         if classifier is not None:
             tool_meta = _find_tool_meta(name)
             if tool_meta:
@@ -66,8 +80,37 @@ def build_server(
                     server_description=server_description,
                 )
                 intent_dict = intent.to_dict()
+                if rule_table is not None:
+                    decision = rule_table.evaluate(
+                        intent.action, intent.sensitivity, intent.externality
+                    )
 
-        log.record(tool=name, arguments=arguments, decision="forward", intent=intent_dict)
+        decision_label = "forward" if classifier is None else decision.value
+        log.record(
+            tool=name,
+            arguments=arguments,
+            decision=decision_label,
+            intent=intent_dict,
+            rule=decision.value if classifier is not None and decision != Decision.ALLOW else None,
+        )
+
+        if decision == Decision.DENY:
+            actions_str = ",".join(intent.action) if intent_dict else "UNKNOWN"
+            sensitivity_str = intent.sensitivity if intent_dict else "unknown"
+            externality_str = intent.externality if intent_dict else "unknown"
+            message = DENY_MESSAGE_TEMPLATE.format(
+                actions=actions_str,
+                sensitivity=sensitivity_str,
+                externality=externality_str,
+            )
+            return types.ServerResult(
+                types.CallToolResult(
+                    content=[types.TextContent(type="text", text=message)],
+                    isError=True,
+                )
+            )
+
+        # ASK is treated as allow for now (MVP; interactive prompt is future work).
         result = await upstream.call_tool(name, arguments)
         return types.ServerResult(result)
 
@@ -108,17 +151,23 @@ async def run_proxy(
     include_server_context: bool = True,
     server_name: str = "",
     server_description: str = "",
+    rules_path: str | None = None,
 ) -> None:
     """Spawn the upstream server and serve the proxy over stdio until EOF."""
     # Inherit the proxy's full environment: the SDK default is a minimal env,
     # which would strip variables the upstream server needs (PATH tweaks,
     # registry overrides, API keys).
+    from pathlib import Path
+
     params = StdioServerParameters(command=command, args=args, env=dict(os.environ))
     log = DecisionLog()
 
     classifier: Classifier | None = None
+    rule_table: RuleTable | None = None
+
     if enable_classifier:
         classifier = Classifier(include_server_context=include_server_context)
+        rule_table = RuleTable.load(Path(rules_path) if rules_path else None)
 
     try:
         async with stdio_client(params) as (upstream_read, upstream_write):
@@ -128,6 +177,7 @@ async def run_proxy(
                     upstream,
                     log,
                     classifier=classifier,
+                    rule_table=rule_table,
                     server_name=server_name,
                     server_description=server_description,
                 )

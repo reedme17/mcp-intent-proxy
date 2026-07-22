@@ -38,6 +38,11 @@ def main() -> None:
         help="upstream server description fed to the classifier",
     )
     parser.add_argument(
+        "--rules",
+        default=None,
+        help="path to rules.yaml policy file (default: ~/.mcp-intent-proxy/rules.yaml)",
+    )
+    parser.add_argument(
         "upstream",
         nargs=argparse.REMAINDER,
         help="upstream MCP server command and its arguments",
@@ -58,6 +63,7 @@ def main() -> None:
             include_server_context=not ns.no_server_context,
             server_name=ns.server_name,
             server_description=ns.server_description,
+            rules_path=ns.rules,
         )
 
     anyio.run(_run)
