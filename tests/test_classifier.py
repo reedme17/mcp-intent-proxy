@@ -122,6 +122,16 @@ class TestClassifier:
         assert result.confidence == 0.0
         assert result.action == FAIL_CLOSED_RESULT.action
 
+    def test_fail_closed_not_cached(self):
+        """Transient failures must not be permanently cached."""
+        client = _mock_client("I don't know how to classify this tool.")
+        clf = Classifier(client=client)
+        clf.classify(tool_name="x", tool_description="x", input_schema={})
+        assert len(clf.cache) == 0
+        # Second call must hit LLM again (not return cached fail-closed).
+        clf.classify(tool_name="x", tool_description="x", input_schema={})
+        assert client.messages.create.call_count == 2
+
     def test_fail_closed_on_low_confidence(self):
         low_conf = """\
 Unclear tool.

@@ -155,7 +155,10 @@ class Classifier:
             server_name=server_name,
             server_description=server_description,
         )
-        self._cache.put(sig, result)
+        # Never cache fail-closed results: they may be caused by transient
+        # errors (network timeout, rate limit). The next call should retry.
+        if result.confidence > 0:
+            self._cache.put(sig, result)
         return result
 
     def classify_batch(
