@@ -60,11 +60,15 @@ async def test_only_trigger_label_generalized(tmp_path: Path):
         params = StdioServerParameters(
             command=sys.executable, args=[UPSTREAM], env=dict(os.environ)
         )
+        async def _always_decline(*args, **kwargs):
+            return "decline"
+
         async with stdio_client(params) as (up_read, up_write):
             async with ClientSession(up_read, up_write) as upstream:
                 await upstream.initialize()
                 server = build_server(
-                    upstream, log, classifier=clf, rule_table=rules, server_name="stub"
+                    upstream, log, classifier=clf, rule_table=rules,
+                    server_name="stub", elicit_fn=_always_decline,
                 )
 
                 # Populate registry.

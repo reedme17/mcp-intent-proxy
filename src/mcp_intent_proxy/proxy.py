@@ -21,6 +21,7 @@ import mcp.types as types
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.server.lowlevel import Server
+from mcp.server.lowlevel.server import request_ctx
 from mcp.server.stdio import stdio_server
 
 from .classifier import Classifier
@@ -43,6 +44,46 @@ DENY_MESSAGE_TEMPLATE = (
 )
 
 
+async def _default_elicit(
+    tool_name: str, trigger_labels: list[str], intent: IntentResult | None
+) -> str:
+    """Ask the user via MCP elicitation. Returns 'accept', 'decline', or 'cancel'."""
+    categories = ", ".join(trigger_labels) if trigger_labels else "unknown"
+    rationale = intent.rationale if intent else ""
+    message = (
+        f"The agent wants to use tool '{tool_name}' which is classified as "
+        f"{categories}. {rationale}\n\n"
+        f"Allow this operation?"
+    )
+    schema = {
+        "type": "object",
+        "properties": {
+            "allow": {
+                "type": "boolean",
+                "title": "Allow this tool call",
+                "description": f"Tool '{tool_name}' is classified as {categories}.",
+            }
+        },
+        "required": ["allow"],
+    }
+    try:
+        ctx = request_ctx.get()
+        result = await ctx.session.elicit(message=message, requestedSchema=schema)
+        if result.action == "accept" and result.content:
+            return "accept" if result.content.get("allow") else "decline"
+        elif result.action == "decline":
+            return "decline"
+        else:
+            return "cancel"
+    except Exception as e:
+        logger.warning("Elicitation failed (client may not support it): %s", e)
+        return "cancel"
+
+
+# Type alias for the elicitation callback (injectable for testing).
+ElicitFn = Any  # async (tool_name, trigger_labels, intent) -> str
+
+
 def build_server(
     upstream: ClientSession,
     log: DecisionLog,
@@ -50,6 +91,7 @@ def build_server(
     rule_table: RuleTable | None = None,
     server_name: str = "",
     server_description: str = "",
+    elicit_fn: ElicitFn | None = None,
 ) -> Server:
     """Build a Server whose tool endpoints forward to the upstream session."""
     server = Server(SERVER_NAME)
@@ -124,33 +166,63 @@ def build_server(
             )
 
         if decision == Decision.ASK:
-            # Generalize ONLY the trigger labels — the specific categories
-            # whose rule produced this ASK decision. A tool tagged
-            # [READ/SEARCH, SEND] denied because of SEND must NOT generalize
-            # a deny for READ/SEARCH.
-            if rule_table is not None and trigger_labels:
-                for label in trigger_labels:
-                    rule_table.set_rule(label, Decision.DENY)
-                rule_table.save()
-                logger.info(
-                    "Generalized deny: tool=%s triggers=%s now denied by policy",
-                    name,
-                    trigger_labels,
+            # Skip elicitation if user already said yes this session.
+            if name in _ask_allowed:
+                result = await upstream.call_tool(name, arguments)
+                return types.ServerResult(result)
+            user_answer = await _elicit(name, trigger_labels, intent)
+
+            if user_answer == "accept":
+                # User said yes: allow THIS tool for this session (cache the
+                # "allowed" answer so we don't ask again), but do NOT generalize
+                # allow to the whole category.
+                _ask_allowed.add(name)
+                result = await upstream.call_tool(name, arguments)
+                return types.ServerResult(result)
+
+            elif user_answer == "decline":
+                # User said no: generalize ONLY the trigger labels to deny.
+                if rule_table is not None and trigger_labels:
+                    for label in trigger_labels:
+                        rule_table.set_rule(label, Decision.DENY)
+                    rule_table.save()
+                    logger.info(
+                        "Generalized deny: tool=%s triggers=%s now denied by policy",
+                        name,
+                        trigger_labels,
+                    )
+                message = DENY_MESSAGE_TEMPLATE.format(
+                    actions=",".join(trigger_labels) if trigger_labels else "UNKNOWN",
+                    sensitivity=intent.sensitivity if intent else "unknown",
+                    externality=intent.externality if intent else "unknown",
                 )
-            message = DENY_MESSAGE_TEMPLATE.format(
-                actions=",".join(trigger_labels) if trigger_labels else "UNKNOWN",
-                sensitivity=intent.sensitivity if intent else "unknown",
-                externality=intent.externality if intent else "unknown",
-            )
-            return types.ServerResult(
-                types.CallToolResult(
-                    content=[types.TextContent(type="text", text=message)],
-                    isError=True,
+                return types.ServerResult(
+                    types.CallToolResult(
+                        content=[types.TextContent(type="text", text=message)],
+                        isError=True,
+                    )
                 )
-            )
+
+            else:
+                # Cancel / client doesn't support elicitation: deny this one
+                # call but do NOT write any persistent rule.
+                return types.ServerResult(
+                    types.CallToolResult(
+                        content=[types.TextContent(
+                            type="text",
+                            text=f"Blocked: awaiting user confirmation for intent={','.join(trigger_labels)}. "
+                                 "The user did not respond. Do not retry.",
+                        )],
+                        isError=True,
+                    )
+                )
 
         result = await upstream.call_tool(name, arguments)
         return types.ServerResult(result)
+
+    # Tools the user has already said "yes" to during this session.
+    _ask_allowed: set[str] = set()
+    _elicit = elicit_fn or _default_elicit
 
     # Registry of known tools populated by _preclassify for lookup at call time.
     _tool_registry: dict[str, dict[str, Any]] = {}

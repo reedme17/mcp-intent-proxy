@@ -84,12 +84,16 @@ async def test_ask_generalizes_to_deny(tmp_path: Path):
             original_default = rules_mod.DEFAULT_RULES_PATH
             rules_mod.DEFAULT_RULES_PATH = rules_path
 
+            async def _always_decline(*args, **kwargs):
+                return "decline"
+
             try:
                 server = build_server(
                     upstream, log,
                     classifier=clf,
                     rule_table=rules,
                     server_name="stub",
+                    elicit_fn=_always_decline,
                 )
 
                 # List tools to populate registry.
