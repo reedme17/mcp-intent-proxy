@@ -69,17 +69,33 @@ class RuleTable:
         The most restrictive matching rule wins across all action labels,
         sensitivity, and externality. Unmatched categories default to allow.
         """
+        decision, _ = self.evaluate_detailed(actions, sensitivity, externality)
+        return decision
+
+    def evaluate_detailed(
+        self, actions: list[str], sensitivity: str, externality: str
+    ) -> tuple[Decision, list[str]]:
+        """Evaluate and also report which labels produced the final decision.
+
+        Returns (decision, trigger_labels). trigger_labels are the category
+        keys whose rule matches the final (most restrictive) decision — the
+        labels the user actually objected to. Single-deny generalization must
+        generalize only these, never every label on the tool: a tool tagged
+        [READ/SEARCH, SEND] denied because of a SEND rule says nothing about
+        the user's stance on READ/SEARCH.
+        """
+        matched: dict[str, Decision] = {}
         worst = DEFAULT_DECISION
-        for label in actions:
-            decision = self._rules.get(label.upper(), DEFAULT_DECISION)
+        for label in [*actions, sensitivity, externality]:
+            key = label.upper()
+            decision = self._rules.get(key, DEFAULT_DECISION)
+            matched[key] = decision
             if _SEVERITY[decision] > _SEVERITY[worst]:
                 worst = decision
-        # Also check sensitivity and externality as rule keys.
-        for label in [sensitivity.upper(), externality.upper()]:
-            decision = self._rules.get(label, DEFAULT_DECISION)
-            if _SEVERITY[decision] > _SEVERITY[worst]:
-                worst = decision
-        return worst
+        if worst == DEFAULT_DECISION:
+            return worst, []
+        triggers = [k for k, d in matched.items() if d == worst]
+        return worst, triggers
 
     def set_rule(self, category: str, decision: Decision) -> None:
         """Programmatically add or update a rule."""

@@ -26,6 +26,7 @@ from mcp.server.stdio import stdio_server
 from .classifier import Classifier
 from .logging import DecisionLog
 from .rules import Decision, RuleTable
+from .taxonomy import IntentResult
 
 logger = logging.getLogger("mcp_intent_proxy")
 
@@ -67,23 +68,38 @@ def build_server(
         arguments = request.params.arguments or {}
 
         intent_dict: dict[str, Any] | None = None
+        intent: IntentResult | None = None
         decision = Decision.ALLOW
+        trigger_labels: list[str] = []
 
         if classifier is not None:
             tool_meta = _find_tool_meta(name)
-            if tool_meta:
-                intent = classifier.classify(
-                    tool_name=name,
-                    tool_description=tool_meta.get("description", ""),
-                    input_schema=tool_meta.get("inputSchema", {}),
-                    server_name=server_name,
-                    server_description=server_description,
-                )
-                intent_dict = intent.to_dict()
-                if rule_table is not None:
-                    decision = rule_table.evaluate(
-                        intent.action, intent.sensitivity, intent.externality
+            if tool_meta is None:
+                # Unknown tool not seen via tools/list — fail-closed.
+                log.record(tool=name, arguments=arguments, decision="deny", intent=None, rule="fail-closed")
+                return types.ServerResult(
+                    types.CallToolResult(
+                        content=[types.TextContent(
+                            type="text",
+                            text="Blocked by policy: unknown tool not in registry. "
+                                 "Do not retry. Inform the user this tool was not "
+                                 "recognized by the authorization proxy.",
+                        )],
+                        isError=True,
                     )
+                )
+            intent = classifier.classify(
+                tool_name=name,
+                tool_description=tool_meta.get("description", ""),
+                input_schema=tool_meta.get("inputSchema", {}),
+                server_name=server_name,
+                server_description=server_description,
+            )
+            intent_dict = intent.to_dict()
+            if rule_table is not None:
+                decision, trigger_labels = rule_table.evaluate_detailed(
+                    intent.action, intent.sensitivity, intent.externality
+                )
 
         decision_label = "forward" if classifier is None else decision.value
         log.record(
@@ -95,13 +111,10 @@ def build_server(
         )
 
         if decision == Decision.DENY:
-            actions_str = ",".join(intent.action) if intent_dict else "UNKNOWN"
-            sensitivity_str = intent.sensitivity if intent_dict else "unknown"
-            externality_str = intent.externality if intent_dict else "unknown"
             message = DENY_MESSAGE_TEMPLATE.format(
-                actions=actions_str,
-                sensitivity=sensitivity_str,
-                externality=externality_str,
+                actions=",".join(intent.action) if intent else "UNKNOWN",
+                sensitivity=intent.sensitivity if intent else "unknown",
+                externality=intent.externality if intent else "unknown",
             )
             return types.ServerResult(
                 types.CallToolResult(
@@ -111,24 +124,23 @@ def build_server(
             )
 
         if decision == Decision.ASK:
-            # MVP: ASK triggers single-deny generalization — the user "said no"
-            # to this tool, so we write category-level deny rules for all of its
-            # action labels. Future work: interactive prompt before generalizing.
-            if rule_table is not None and intent_dict:
-                for action_label in intent.action:
-                    rule_table.set_rule(action_label, Decision.DENY)
+            # Generalize ONLY the trigger labels — the specific categories
+            # whose rule produced this ASK decision. A tool tagged
+            # [READ/SEARCH, SEND] denied because of SEND must NOT generalize
+            # a deny for READ/SEARCH.
+            if rule_table is not None and trigger_labels:
+                for label in trigger_labels:
+                    rule_table.set_rule(label, Decision.DENY)
                 rule_table.save()
                 logger.info(
-                    "Generalized deny: tool=%s actions=%s now denied by policy",
+                    "Generalized deny: tool=%s triggers=%s now denied by policy",
                     name,
-                    intent.action,
+                    trigger_labels,
                 )
-            # After generalization, deny this specific call too.
-            actions_str = ",".join(intent.action)
             message = DENY_MESSAGE_TEMPLATE.format(
-                actions=actions_str,
-                sensitivity=intent.sensitivity,
-                externality=intent.externality,
+                actions=",".join(trigger_labels) if trigger_labels else "UNKNOWN",
+                sensitivity=intent.sensitivity if intent else "unknown",
+                externality=intent.externality if intent else "unknown",
             )
             return types.ServerResult(
                 types.CallToolResult(
