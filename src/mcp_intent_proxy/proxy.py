@@ -110,7 +110,33 @@ def build_server(
                 )
             )
 
-        # ASK is treated as allow for now (MVP; interactive prompt is future work).
+        if decision == Decision.ASK:
+            # MVP: ASK triggers single-deny generalization — the user "said no"
+            # to this tool, so we write category-level deny rules for all of its
+            # action labels. Future work: interactive prompt before generalizing.
+            if rule_table is not None and intent_dict:
+                for action_label in intent.action:
+                    rule_table.set_rule(action_label, Decision.DENY)
+                rule_table.save()
+                logger.info(
+                    "Generalized deny: tool=%s actions=%s now denied by policy",
+                    name,
+                    intent.action,
+                )
+            # After generalization, deny this specific call too.
+            actions_str = ",".join(intent.action)
+            message = DENY_MESSAGE_TEMPLATE.format(
+                actions=actions_str,
+                sensitivity=intent.sensitivity,
+                externality=intent.externality,
+            )
+            return types.ServerResult(
+                types.CallToolResult(
+                    content=[types.TextContent(type="text", text=message)],
+                    isError=True,
+                )
+            )
+
         result = await upstream.call_tool(name, arguments)
         return types.ServerResult(result)
 
