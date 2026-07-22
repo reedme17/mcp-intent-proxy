@@ -45,7 +45,7 @@ async def test_accept_forwards_and_remembers(tmp_path: Path):
     async def _accept(*args, **kwargs):
         nonlocal elicit_call_count
         elicit_call_count += 1
-        return "accept"
+        return "allow_once"
 
     params = StdioServerParameters(
         command=sys.executable, args=[UPSTREAM], env=dict(os.environ)

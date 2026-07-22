@@ -46,7 +46,7 @@ async def test_only_trigger_label_generalized(tmp_path: Path):
     })
     clf.cache.put(sig, multi_intent)
 
-    # Rule: only SEND is ask. READ/SEARCH has no rule (default allow).
+    # Rule: only SEND is ask. READ/SEARCH is unregulated (defaults to ask too).
     rules_path = tmp_path / "rules.yaml"
     rules_path.write_text("SEND: ask\n")
     rules = RuleTable.load(rules_path)
@@ -60,22 +60,28 @@ async def test_only_trigger_label_generalized(tmp_path: Path):
         params = StdioServerParameters(
             command=sys.executable, args=[UPSTREAM], env=dict(os.environ)
         )
-        async def _always_decline(*args, **kwargs):
-            return "decline"
+
+        # Per-category answers: user tolerates READ/SEARCH this once but
+        # objects to SEND. Only SEND may be generalized.
+        async def _per_label(tool_name, trigger_labels, intent):
+            label = trigger_labels[0]
+            if label == "SEND":
+                return "never_category"
+            return "allow_once"
 
         async with stdio_client(params) as (up_read, up_write):
             async with ClientSession(up_read, up_write) as upstream:
                 await upstream.initialize()
                 server = build_server(
                     upstream, log, classifier=clf, rule_table=rules,
-                    server_name="stub", elicit_fn=_always_decline,
+                    server_name="stub", elicit_fn=_per_label,
                 )
 
                 # Populate registry.
                 list_req = ListToolsRequest(method="tools/list", params=None)
                 await server.request_handlers[ListToolsRequest](list_req)
 
-                # Call echo — triggers ASK on SEND.
+                # Call echo — asks per category; user denies SEND.
                 call_req = CallToolRequest(
                     method="tools/call",
                     params=CallToolRequestParams(name="echo", arguments={"text": "hi"}),

@@ -112,7 +112,8 @@ async def test_allow_forwards_normally(tmp_path: Path):
     })
     clf.cache.put(sig, read_result)
 
-    rules = RuleTable({"DELETE": Decision.DENY})
+    # Explicit allow: under fail-closed defaults an unregulated category asks.
+    rules = RuleTable({"DELETE": Decision.DENY, "READ/SEARCH": Decision.ALLOW})
     log = DecisionLog(log_dir=tmp_path)
 
     import os

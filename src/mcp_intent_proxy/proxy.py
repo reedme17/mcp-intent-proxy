@@ -44,44 +44,67 @@ DENY_MESSAGE_TEMPLATE = (
 )
 
 
+# Elicitation answers: what the user chose for an ASK decision.
+ANSWER_ALLOW_ONCE = "allow_once"
+ANSWER_ALWAYS_CATEGORY = "always_category"
+ANSWER_NEVER_CATEGORY = "never_category"
+ANSWER_CANCEL = "cancel"
+
+
 async def _default_elicit(
     tool_name: str, trigger_labels: list[str], intent: IntentResult | None
 ) -> str:
-    """Ask the user via MCP elicitation. Returns 'accept', 'decline', or 'cancel'."""
+    """Ask the user via MCP elicitation.
+
+    Three-way choice so the rule table crystallizes per category during use:
+    - allow_once: forward this call only, write no rule
+    - always_category: write allow rules for the trigger categories
+    - never_category: write deny rules for the trigger categories
+
+    Returns one of the ANSWER_* constants.
+    """
     categories = ", ".join(trigger_labels) if trigger_labels else "unknown"
     rationale = intent.rationale if intent else ""
     message = (
         f"The agent wants to use tool '{tool_name}' which is classified as "
         f"{categories}. {rationale}\n\n"
-        f"Allow this operation?"
+        f"Choose: allow this call only, always allow {categories} operations, "
+        f"or never allow {categories} operations."
     )
     schema = {
         "type": "object",
         "properties": {
-            "allow": {
-                "type": "boolean",
-                "title": "Allow this tool call",
-                "description": f"Tool '{tool_name}' is classified as {categories}.",
+            "choice": {
+                "type": "string",
+                "title": f"Tool '{tool_name}' wants to run ({categories})",
+                "oneOf": [
+                    {"const": ANSWER_ALLOW_ONCE, "title": "Allow this call only"},
+                    {"const": ANSWER_ALWAYS_CATEGORY, "title": f"Always allow {categories}"},
+                    {"const": ANSWER_NEVER_CATEGORY, "title": f"Never allow {categories}"},
+                ],
             }
         },
-        "required": ["allow"],
+        "required": ["choice"],
     }
     try:
         ctx = request_ctx.get()
         result = await ctx.session.elicit(message=message, requestedSchema=schema)
         if result.action == "accept" and result.content:
-            return "accept" if result.content.get("allow") else "decline"
+            choice = result.content.get("choice")
+            if choice in (ANSWER_ALLOW_ONCE, ANSWER_ALWAYS_CATEGORY, ANSWER_NEVER_CATEGORY):
+                return choice
+            return ANSWER_CANCEL
         elif result.action == "decline":
-            return "decline"
+            return ANSWER_NEVER_CATEGORY
         else:
-            return "cancel"
+            return ANSWER_CANCEL
     except Exception as e:
         logger.warning("Elicitation failed (client may not support it): %s", e)
-        return "cancel"
+        return ANSWER_CANCEL
 
 
 # Type alias for the elicitation callback (injectable for testing).
-ElicitFn = Any  # async (tool_name, trigger_labels, intent) -> str
+ElicitFn = Any  # async (tool_name, trigger_labels, intent) -> str (ANSWER_*)
 
 
 def build_server(
@@ -114,6 +137,7 @@ def build_server(
         decision = Decision.ALLOW
         trigger_labels: list[str] = []
         late_registered = False
+        mixed_envelope = False
 
         if classifier is not None:
             tool_meta = _find_tool_meta(name)
@@ -153,9 +177,12 @@ def build_server(
             )
             intent_dict = intent.to_dict()
             if rule_table is not None:
-                decision, trigger_labels = rule_table.evaluate_detailed(
+                eval_result = rule_table.evaluate_detailed(
                     intent.action, intent.sensitivity, intent.externality
                 )
+                decision = eval_result.decision
+                trigger_labels = eval_result.triggers
+                mixed_envelope = eval_result.mixed
             # Late-registered tool: escalate to ASK unless already DENY.
             if late_registered and decision == Decision.ALLOW:
                 decision = Decision.ASK
@@ -209,32 +236,76 @@ def build_server(
             if name in _ask_allowed:
                 result = await upstream.call_tool(name, arguments)
                 return types.ServerResult(result)
-            user_answer = await _elicit(name, trigger_labels, intent)
 
-            if user_answer == "accept":
-                # User said yes: allow THIS tool for this session (cache the
-                # "allowed" answer so we don't ask again), but do NOT generalize
-                # allow to the whole category.
-                _ask_allowed.add(name)
-                result = await upstream.call_tool(name, arguments)
-                return types.ServerResult(result)
+            ask_labels = trigger_labels or (list(intent.action) if intent else [])
 
-            elif user_answer == "decline":
-                # User said no: generalize ONLY the trigger labels to deny.
-                if rule_table is not None and trigger_labels:
-                    for label in trigger_labels:
+            # Mixed envelope: tell the user why this became a question.
+            ask_intent = intent
+            if mixed_envelope and intent is not None:
+                ask_intent = IntentResult(
+                    action=intent.action,
+                    sensitivity=intent.sensitivity,
+                    externality=intent.externality,
+                    confidence=intent.confidence,
+                    rationale=(
+                        f"[This tool combines denied capabilities "
+                        f"({', '.join(ask_labels)}) with permitted ones — "
+                        f"a blanket block would break its benign uses.] "
+                        + intent.rationale
+                    ),
+                )
+
+            # One question per category: each answer settles exactly one
+            # label, so every written rule is attributable to an explicit
+            # user statement about that category (no bundled consent).
+            # Interruptions are bounded by the number of categories — each
+            # settled category never asks again.
+            answers: dict[str, str] = {}
+            for label in ask_labels:
+                answer = await _elicit(name, [label], ask_intent)
+                answers[label] = answer
+                if answer == ANSWER_NEVER_CATEGORY:
+                    # Call is blocked regardless; leave remaining categories
+                    # unsettled rather than asking about a dead call.
+                    break
+
+            if rule_table is not None:
+                wrote = False
+                for label, answer in answers.items():
+                    if answer == ANSWER_ALWAYS_CATEGORY:
+                        rule_table.set_rule(label, Decision.ALLOW)
+                        wrote = True
+                    elif answer == ANSWER_NEVER_CATEGORY:
                         rule_table.set_rule(label, Decision.DENY)
+                        wrote = True
+                if wrote:
                     rule_table.save()
                     logger.info(
-                        "Generalized deny: tool=%s triggers=%s now denied by policy",
+                        "Rules updated from user answers: tool=%s answers=%s",
                         name,
-                        trigger_labels,
+                        answers,
                     )
+
+            denied_labels = [
+                l for l, a in answers.items() if a == ANSWER_NEVER_CATEGORY
+            ]
+            cancelled_labels = [
+                l for l, a in answers.items() if a == ANSWER_CANCEL
+            ]
+
+            if denied_labels:
                 message = DENY_MESSAGE_TEMPLATE.format(
-                    actions=",".join(trigger_labels) if trigger_labels else "UNKNOWN",
+                    actions=",".join(denied_labels),
                     sensitivity=intent.sensitivity if intent else "unknown",
                     externality=intent.externality if intent else "unknown",
                 )
+                if mixed_envelope:
+                    message += (
+                        " Note: this tool was blocked because of its "
+                        f"{','.join(denied_labels)} capability. If the task only "
+                        "needs its other capabilities, use a narrower tool that "
+                        "does not include the denied capability."
+                    )
                 return types.ServerResult(
                     types.CallToolResult(
                         content=[types.TextContent(type="text", text=message)],
@@ -242,19 +313,27 @@ def build_server(
                     )
                 )
 
-            else:
-                # Cancel / client doesn't support elicitation: deny this one
-                # call but do NOT write any persistent rule.
+            if cancelled_labels:
+                # No answer is not an opinion: deny this one call, write no
+                # rule, ask again next time.
                 return types.ServerResult(
                     types.CallToolResult(
                         content=[types.TextContent(
                             type="text",
-                            text=f"Blocked: awaiting user confirmation for intent={','.join(trigger_labels)}. "
+                            text=f"Blocked: awaiting user confirmation for intent={','.join(cancelled_labels)}. "
                                  "The user did not respond. Do not retry.",
                         )],
                         isError=True,
                     )
                 )
+
+            # All labels answered allow-once or always-category: forward.
+            # Remember allow-once answers for the session so the same tool
+            # doesn't re-ask (always-category labels are settled by rule).
+            if any(a == ANSWER_ALLOW_ONCE for a in answers.values()):
+                _ask_allowed.add(name)
+            result = await upstream.call_tool(name, arguments)
+            return types.ServerResult(result)
 
         result = await upstream.call_tool(name, arguments)
         return types.ServerResult(result)

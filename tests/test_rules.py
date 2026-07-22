@@ -8,32 +8,65 @@ from mcp_intent_proxy.rules import Decision, RuleTable
 
 
 class TestEvaluation:
-    def test_empty_table_allows_all(self):
+    def test_unregulated_action_asks(self):
+        # Fail-closed default: no rule for the category → ask, not allow.
         rt = RuleTable()
-        assert rt.evaluate(["DELETE"], "non-specific", "internal") == Decision.ALLOW
+        res = rt.evaluate_detailed(["DELETE"], "non-specific", "internal")
+        assert res.decision == Decision.ASK
+        assert res.triggers == ["DELETE"]
+        assert res.mixed is False
+
+    def test_explicit_allow(self):
+        rt = RuleTable({"READ/SEARCH": Decision.ALLOW})
+        assert rt.evaluate(["READ/SEARCH"], "non-specific", "internal") == Decision.ALLOW
 
     def test_single_action_deny(self):
         rt = RuleTable({"DELETE": Decision.DENY})
-        assert rt.evaluate(["DELETE"], "non-specific", "internal") == Decision.DENY
+        res = rt.evaluate_detailed(["DELETE"], "non-specific", "internal")
+        assert res.decision == Decision.DENY
+        assert res.triggers == ["DELETE"]
+        assert res.mixed is False
 
-    def test_most_restrictive_wins(self):
+    def test_mixed_envelope_downgrades_deny_to_ask(self):
+        # Tool can READ and DELETE; only DELETE denied. A blanket deny would
+        # brick the benign READ use → downgrade to ASK, flag mixed.
         rt = RuleTable({"READ/SEARCH": Decision.ALLOW, "DELETE": Decision.DENY})
-        assert rt.evaluate(["READ/SEARCH", "DELETE"], "non-specific", "internal") == Decision.DENY
+        res = rt.evaluate_detailed(["READ/SEARCH", "DELETE"], "non-specific", "internal")
+        assert res.decision == Decision.ASK
+        assert res.triggers == ["DELETE"]
+        assert res.mixed is True
+
+    def test_all_actions_denied_stays_deny(self):
+        rt = RuleTable({"DELETE": Decision.DENY, "SEND": Decision.DENY})
+        res = rt.evaluate_detailed(["DELETE", "SEND"], "non-specific", "internal")
+        assert res.decision == Decision.DENY
+        assert set(res.triggers) == {"DELETE", "SEND"}
+        assert res.mixed is False
 
     def test_ask_beats_allow(self):
         rt = RuleTable({"SEND": Decision.ASK})
         assert rt.evaluate(["SEND"], "non-specific", "external") == Decision.ASK
 
-    def test_deny_beats_ask(self):
+    def test_mixed_deny_and_ask(self):
+        # SPEND denied, SEND merely ask → still a mixed envelope (SEND is
+        # not denied), so the call asks rather than hard-blocking.
         rt = RuleTable({"SEND": Decision.ASK, "SPEND": Decision.DENY})
-        assert rt.evaluate(["SEND", "SPEND"], "financial", "external") == Decision.DENY
+        res = rt.evaluate_detailed(["SEND", "SPEND"], "financial", "external")
+        assert res.decision == Decision.ASK
+        assert res.triggers == ["SPEND"]
+        assert res.mixed is True
 
-    def test_sensitivity_as_rule_key(self):
-        rt = RuleTable({"FINANCIAL": Decision.DENY})
-        assert rt.evaluate(["CREATE"], "financial", "internal") == Decision.DENY
+    def test_sensitivity_deny_pervades_whole_tool(self):
+        # Deny via sensitivity applies to the tool as a whole — never
+        # downgraded even though the action is not itself denied.
+        rt = RuleTable({"FINANCIAL": Decision.DENY, "CREATE": Decision.ALLOW})
+        res = rt.evaluate_detailed(["CREATE"], "financial", "internal")
+        assert res.decision == Decision.DENY
+        assert res.triggers == ["FINANCIAL"]
+        assert res.mixed is False
 
     def test_externality_as_rule_key(self):
-        rt = RuleTable({"EXTERNAL": Decision.ASK})
+        rt = RuleTable({"EXTERNAL": Decision.ASK, "READ/SEARCH": Decision.ALLOW})
         assert rt.evaluate(["READ/SEARCH"], "non-specific", "external") == Decision.ASK
 
     def test_case_insensitive_lookup(self):
