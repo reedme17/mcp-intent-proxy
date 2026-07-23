@@ -30,3 +30,7 @@ config.local.*
 tmp/
 scratch/
 *.local
+
+# Eval results (may reference private corpus)
+eval/last_results.json
+eval/*_results.json
