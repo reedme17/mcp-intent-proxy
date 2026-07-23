@@ -164,4 +164,3 @@ forwarded result or a blocked error. Mirrors `proxy.py::_call_tool`.
 | Deny — policy (S7) | isError, instructive message | — (rule already existed) |
 | Deny — user "never" (S9) | isError, instructive message | `CATEGORY: deny` written |
 | Deny — cancelled (S9) | isError, "awaiting confirmation" | none |
-```
